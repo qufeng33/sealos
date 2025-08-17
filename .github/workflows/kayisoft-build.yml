@@ -1,0 +1,401 @@
+name: Kayisoft Sealos Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: "版本标签 (必填，如: v1.0.0)"
+        required: true
+        type: string
+      build_architecture:
+        description: "构建架构"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - "both"
+          - "amd64"
+          - "arm64"
+      upload_to_minio:
+        description: "是否上传到 MinIO"
+        required: false
+        default: true
+        type: boolean
+      create_release:
+        description: "是否创建 GitHub Release"
+        required: false
+        default: false
+        type: boolean
+
+env:
+  GO_VERSION: "1.23"
+
+jobs:
+  build-packages:
+    # 只在您的仓库的 kayisoft 分支运行
+    if: github.repository == 'qufeng33/sealos' && github.ref_name == 'kayisoft'
+    runs-on: ubuntu-20.04  # 使用 Ubuntu 20.04 以获得更好的 glibc 兼容性
+    environment: kayisoft  # 指定使用 kayisoft 环境来访问环境 secrets
+    permissions:
+      contents: write
+      packages: write
+
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            cc: gcc
+          - arch: arm64
+            cc: aarch64-linux-gnu-gcc
+
+    steps:
+      - name: Checkout kayisoft branch
+        uses: actions/checkout@v4
+        with:
+          ref: kayisoft
+          fetch-depth: 0
+
+      - name: Validate Version Tag
+        run: |
+          VERSION="${{ github.event.inputs.version_tag }}"
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
+            echo "❌ 版本格式错误！请使用格式: v1.0.0 或 v1.0.0-beta1"
+            exit 1
+          fi
+          echo "✅ 版本格式正确: $VERSION"
+
+      - name: Setup Golang with cache
+        uses: magnetikonline/action-golang-cache@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt update && sudo apt install -y \
+            gcc gcc-aarch64-linux-gnu \
+            libbtrfs-dev libgpgme-dev libdevmapper-dev \
+            qemu-user-static binfmt-support \
+            ruby-dev rubygems build-essential
+          sudo gem install --no-document fpm
+
+      - name: Build Sealos Binaries
+        if: ${{ github.event.inputs.build_architecture == 'both' || github.event.inputs.build_architecture == matrix.arch }}
+        working-directory: lifecycle
+        env:
+          VERSION: ${{ github.event.inputs.version_tag }}
+          GOARCH: ${{ matrix.arch }}
+          CC: ${{ matrix.cc }}
+        run: |
+          echo "🔨 Building Sealos for ${{ matrix.arch }} with CGO enabled (Ubuntu 20.04 compatibility)"
+
+          # 创建输出目录
+          mkdir -p dist/${{ matrix.arch }}
+
+          # 获取构建信息
+          GIT_COMMIT=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date +%FT%T%z)
+
+          echo "📦 Building sealos (CGO enabled)..."
+          CGO_ENABLED=1 CC=${{ matrix.cc }} GOOS=linux GOARCH=${{ matrix.arch }} \
+            go build \
+            -tags "containers_image_openpgp netgo exclude_graphdriver_devicemapper static osusergo exclude_graphdriver_btrfs" \
+            -trimpath \
+            -ldflags "-X github.com/labring/sealos/pkg/version.gitVersion=${VERSION} -X github.com/labring/sealos/pkg/version.gitCommit=${GIT_COMMIT} -X github.com/labring/sealos/pkg/version.buildDate=${BUILD_DATE} -s -w" \
+            -o dist/${{ matrix.arch }}/sealos ./cmd/sealos
+            
+          echo "📦 Building sealctl (CGO enabled)..."
+          CGO_ENABLED=1 CC=${{ matrix.cc }} GOOS=linux GOARCH=${{ matrix.arch }} \
+            go build \
+            -tags "containers_image_openpgp netgo exclude_graphdriver_devicemapper static osusergo exclude_graphdriver_btrfs" \
+            -trimpath \
+            -ldflags "-X github.com/labring/sealos/pkg/version.gitVersion=${VERSION} -X github.com/labring/sealos/pkg/version.gitCommit=${GIT_COMMIT} -X github.com/labring/sealos/pkg/version.buildDate=${BUILD_DATE} -s -w" \
+            -o dist/${{ matrix.arch }}/sealctl ./cmd/sealctl
+            
+          echo "📦 Building lvscare (CGO disabled)..."
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} \
+            go build \
+            -tags "containers_image_openpgp netgo exclude_graphdriver_devicemapper static osusergo exclude_graphdriver_btrfs" \
+            -trimpath \
+            -ldflags "-X github.com/labring/sealos/pkg/version.gitVersion=${VERSION} -X github.com/labring/sealos/pkg/version.gitCommit=${GIT_COMMIT} -X github.com/labring/sealos/pkg/version.buildDate=${BUILD_DATE} -s -w" \
+            -o dist/${{ matrix.arch }}/lvscare ./cmd/lvscare
+            
+          echo "📦 Building image-cri-shim (CGO disabled)..."
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} \
+            go build \
+            -tags "containers_image_openpgp netgo exclude_graphdriver_devicemapper static osusergo exclude_graphdriver_btrfs" \
+            -trimpath \
+            -ldflags "-X github.com/labring/sealos/pkg/version.gitVersion=${VERSION} -X github.com/labring/sealos/pkg/version.gitCommit=${GIT_COMMIT} -X github.com/labring/sealos/pkg/version.buildDate=${BUILD_DATE} -s -w" \
+            -o dist/${{ matrix.arch }}/image-cri-shim ./cmd/image-cri-shim
+            
+          # 验证构建结果
+          echo "✅ Build completed. File details:"
+          ls -la dist/${{ matrix.arch }}/
+          file dist/${{ matrix.arch }}/*
+          
+          # 检查动态链接库依赖
+          echo "🔍 Checking dynamic library dependencies:"
+          for binary in dist/${{ matrix.arch }}/*; do
+            echo "=== $(basename $binary) ==="
+            ldd "$binary" 2>/dev/null || echo "Static binary or ldd failed"
+          done
+
+          # 验证二进制可执行性
+          echo "🔍 Testing binary execution:"
+          for binary in dist/${{ matrix.arch }}/*; do
+            if [[ "${{ matrix.arch }}" == "amd64" ]]; then
+              echo "Testing $(basename $binary):"
+              $binary version || echo "Version command not available"
+            else
+              echo "Skipping execution test for arm64 on amd64 runner"
+            fi
+          done
+
+      - name: Create DEB Package
+        if: ${{ github.event.inputs.build_architecture == 'both' || github.event.inputs.build_architecture == matrix.arch }}
+        working-directory: lifecycle
+        run: |
+          VERSION_CLEAN="${{ github.event.inputs.version_tag }}"
+          VERSION_CLEAN=${VERSION_CLEAN#v}  # 移除 v 前缀
+          ARCH=${{ matrix.arch }}
+
+          echo "📦 Creating DEB package for ${ARCH} version ${VERSION_CLEAN}"
+
+          # 创建打包目录结构
+          mkdir -p pkg-build/usr/local/bin
+          mkdir -p pkg-build/usr/share/doc/sealos-kayisoft
+
+          # 复制二进制文件
+          cp dist/${ARCH}/sealos pkg-build/usr/local/bin/
+          cp dist/${ARCH}/sealctl pkg-build/usr/local/bin/
+          cp dist/${ARCH}/lvscare pkg-build/usr/local/bin/
+          cp dist/${ARCH}/image-cri-shim pkg-build/usr/local/bin/
+          chmod +x pkg-build/usr/local/bin/*
+
+          # 创建简单的文档
+          cat > pkg-build/usr/share/doc/sealos-kayisoft/README << EOF
+          Sealos - Cloud OS distribution with Kubernetes as kernel
+
+          Kayisoft Custom Build
+          Version: ${VERSION_CLEAN}
+          Architecture: ${ARCH}
+          Build Date: $(date)
+
+          For more information, visit: https://github.com/qufeng33/sealos
+          EOF
+
+          # 使用 FPM 创建 DEB 包 (CGO enabled, Ubuntu 20.04 glibc)
+          fpm -s dir -t deb \
+            --name sealos-kayisoft \
+            --version ${VERSION_CLEAN} \
+            --architecture ${ARCH} \
+            --maintainer "Kayisoft <qufeng33@hotmail.com>" \
+            --description "Cloud OS distribution with Kubernetes as kernel (Kayisoft Custom Build - Ubuntu 20.04 Compatible)" \
+            --url "https://github.com/qufeng33/sealos" \
+            --license "Apache-2.0" \
+            --vendor "Kayisoft" \
+            --category "admin" \
+            --depends "libc6 (>= 2.31)" \
+            --deb-priority optional \
+            --deb-compression xz \
+            --package dist/ \
+            -C pkg-build .
+
+      - name: Create RPM Package
+        if: ${{ github.event.inputs.build_architecture == 'both' || github.event.inputs.build_architecture == matrix.arch }}
+        working-directory: lifecycle
+        run: |
+          VERSION_CLEAN="${{ github.event.inputs.version_tag }}"
+          VERSION_CLEAN=${VERSION_CLEAN#v}  # 移除 v 前缀
+          ARCH=${{ matrix.arch }}
+
+          echo "📦 Creating RPM package for ${ARCH} version ${VERSION_CLEAN}"
+
+          # 使用 FPM 创建 RPM 包 (CGO enabled, Ubuntu 20.04 glibc compatible)
+          fpm -s dir -t rpm \
+            --name sealos-kayisoft \
+            --version ${VERSION_CLEAN} \
+            --architecture ${ARCH} \
+            --maintainer "Kayisoft <qufeng33@hotmail.com>" \
+            --description "Cloud OS distribution with Kubernetes as kernel (Kayisoft Custom Build - Ubuntu 20.04 Compatible)" \
+            --url "https://github.com/qufeng33/sealos" \
+            --license "Apache-2.0" \
+            --vendor "Kayisoft" \
+            --category "System Environment/Base" \
+            --depends "glibc >= 2.31" \
+            --rpm-compression xz \
+            --package dist/ \
+            -C pkg-build .
+
+      - name: List Generated Packages
+        if: ${{ github.event.inputs.build_architecture == 'both' || github.event.inputs.build_architecture == matrix.arch }}
+        working-directory: lifecycle
+        run: |
+          echo "📋 Generated packages:"
+          ls -la dist/*.{deb,rpm} 2>/dev/null || echo "No packages found"
+
+          echo ""
+          echo "📊 Package sizes:"
+          du -h dist/*.{deb,rpm} 2>/dev/null || echo "No packages to measure"
+
+      - name: Upload Packages to MinIO
+        if: ${{ (github.event.inputs.build_architecture == 'both' || github.event.inputs.build_architecture == matrix.arch) && github.event.inputs.upload_to_minio == 'true' }}
+        working-directory: lifecycle
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.KAYISOFT_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.KAYISOFT_MINIO_SECRET_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.KAYISOFT_MINIO_REGION || 'us-east-1' }}
+          MINIO_ENDPOINT: ${{ secrets.KAYISOFT_MINIO_ENDPOINT }}
+          MINIO_BUCKET: ${{ secrets.KAYISOFT_MINIO_BUCKET }}
+          MINIO_PREFIX: ${{ secrets.KAYISOFT_MINIO_PREFIX || 'sealos-packages' }}
+        run: |
+          echo "🔧 Setting up AWS CLI for MinIO..."
+          
+          # 检查 AWS CLI 是否已安装
+          if ! command -v aws &> /dev/null; then
+            echo "Installing AWS CLI..."
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip awscliv2.zip
+            sudo ./aws/install
+          else
+            echo "AWS CLI already installed: $(aws --version)"
+          fi
+
+          # 配置 AWS CLI 使用 MinIO endpoint
+          aws configure set aws_access_key_id "${AWS_ACCESS_KEY_ID}"
+          aws configure set aws_secret_access_key "${AWS_SECRET_ACCESS_KEY}"
+          aws configure set default.region "${AWS_DEFAULT_REGION}"
+
+          echo "☁️ Uploading packages to MinIO..."
+          VERSION=${{ github.event.inputs.version_tag }}
+          ARCH=${{ matrix.arch }}
+          
+          # 检查必需的环境变量
+          if [[ -z "${MINIO_ENDPOINT}" || -z "${MINIO_BUCKET}" ]]; then
+            echo "❌ Error: MINIO_ENDPOINT and MINIO_BUCKET must be set"
+            exit 1
+          fi
+          
+          echo "MinIO Configuration:"
+          echo "  Endpoint: ${MINIO_ENDPOINT}"
+          echo "  Bucket: ${MINIO_BUCKET}"
+          echo "  Prefix: ${MINIO_PREFIX}"
+          echo "  Version: ${VERSION}"
+          echo "  Architecture: ${ARCH}"
+
+          # 上传每个包
+          for package in dist/*.{deb,rpm}; do
+            if [[ -f "$package" ]]; then
+              BASENAME=$(basename "$package")
+              PACKAGE_TYPE=${BASENAME##*.}  # deb 或 rpm
+              S3_KEY="${MINIO_PREFIX}/${VERSION}/${ARCH}/${BASENAME}"
+              
+              echo "📤 Uploading $package to MinIO..."
+              echo "   Bucket: ${MINIO_BUCKET}"
+              echo "   Key: ${S3_KEY}"
+              
+              aws s3 cp "$package" "s3://${MINIO_BUCKET}/${S3_KEY}" \
+                --endpoint-url "${MINIO_ENDPOINT}" \
+                --content-type "application/octet-stream" \
+                --metadata "version=${VERSION},arch=${ARCH},build-date=$(date -u +%Y-%m-%dT%H:%M:%SZ),package-type=${PACKAGE_TYPE}"
+              
+              if [[ $? -eq 0 ]]; then
+                echo "✅ Successfully uploaded ${BASENAME}"
+                
+                # 创建 latest 链接
+                LATEST_KEY="${MINIO_PREFIX}/latest/${ARCH}/${BASENAME}"
+                echo "🔗 Creating latest link: ${LATEST_KEY}"
+                aws s3 cp "s3://${MINIO_BUCKET}/${S3_KEY}" "s3://${MINIO_BUCKET}/${LATEST_KEY}" \
+                  --endpoint-url "${MINIO_ENDPOINT}"
+                
+                # 添加到构建信息 - 简化版本，不依赖 jq
+                echo "Package: ${BASENAME}, URL: ${MINIO_ENDPOINT}/${MINIO_BUCKET}/${S3_KEY}" >> build-info-${ARCH}.txt
+              else
+                echo "❌ Failed to upload ${BASENAME}"
+              fi
+            fi
+          done
+
+          # 上传构建信息 - 简化版本
+          echo "Build Info for ${ARCH}:" > build-info-${ARCH}.txt
+          echo "Version: ${VERSION}" >> build-info-${ARCH}.txt
+          echo "Architecture: ${ARCH}" >> build-info-${ARCH}.txt
+          echo "Build Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> build-info-${ARCH}.txt
+          echo "Commit: $(git rev-parse HEAD)" >> build-info-${ARCH}.txt
+          echo "Branch: kayisoft" >> build-info-${ARCH}.txt
+          echo "Packages:" >> build-info-${ARCH}.txt
+          
+          aws s3 cp build-info-${ARCH}.txt "s3://${MINIO_BUCKET}/${MINIO_PREFIX}/${VERSION}/build-info-${ARCH}.txt" \
+            --endpoint-url "${MINIO_ENDPOINT}" \
+            --content-type "text/plain" || echo "⚠️ Warning: Failed to upload build info"
+
+          echo "🎉 Upload completed for ${ARCH}"
+
+      - name: Upload Build Artifacts to GitHub
+        if: ${{ github.event.inputs.build_architecture == 'both' || github.event.inputs.build_architecture == matrix.arch }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sealos-packages-${{ matrix.arch }}
+          path: |
+            lifecycle/dist/*.deb
+            lifecycle/dist/*.rpm
+            lifecycle/build-info-${{ matrix.arch }}.txt
+          retention-days: 30
+
+  create-release:
+    if: ${{ github.event.inputs.create_release == 'true' }}
+    needs: build-packages
+    runs-on: ubuntu-20.04  # 与构建保持一致
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: kayisoft
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.version_tag }}
+          name: "Sealos Kayisoft ${{ github.event.inputs.version_tag }}"
+          body: |
+            ## Sealos Kayisoft Build ${{ github.event.inputs.version_tag }}
+
+            ### 📦 Package Downloads
+
+            This release contains custom-built Sealos packages for both amd64 and arm64 architectures.
+
+            ### 🏗️ Build Information
+            - **Version**: ${{ github.event.inputs.version_tag }}
+            - **Branch**: kayisoft
+            - **Build Date**: ${{ github.run_id }}
+            - **Architectures**: ${{ github.event.inputs.build_architecture }}
+
+            ### 📥 Installation
+
+            **Ubuntu/Debian:**
+            ```bash
+            # Download and install DEB package
+            wget https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.version_tag }}/sealos-kayisoft_VERSION_ARCH.deb
+            sudo dpkg -i sealos-kayisoft_VERSION_ARCH.deb
+            ```
+
+            **CentOS/RHEL/Fedora:**
+            ```bash
+            # Download and install RPM package  
+            wget https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.version_tag }}/sealos-kayisoft-VERSION.ARCH.rpm
+            sudo rpm -i sealos-kayisoft-VERSION.ARCH.rpm
+            ```
+
+            ### 🔗 MinIO Downloads
+            Packages are also available on our MinIO server for faster access.
+
+          files: artifacts/**/*
+          draft: false
+          prerelease: ${{ contains(github.event.inputs.version_tag, '-') }}
+          generate_release_notes: true
